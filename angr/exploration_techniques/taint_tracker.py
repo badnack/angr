@@ -30,16 +30,6 @@ TAINT_APPLIED = 'taint_applied'
 BACK_JUMPS = 'back_jumps'
 
 
-# Arch spec info
-def ordered_argument_registers(arch):
-    return list(filter(lambda x: x.argument is True, arch.register_list))
-
-
-# HACK: FIXME: This works, but this is an accident
-def return_register(arch):
-    return ordered_argument_registers(arch)[0]
-
-
 def is_tainted(var, state=None, taint_buf=TAINT_BUF):
     """
     Check whether the variable is tainted or not.
@@ -369,9 +359,6 @@ class TaintTracker(ExplorationTechnique):
         :return: concretization value
         """
 
-        def get_key_cnt(x):
-            return str(x)
-
         # check if uncontrained
         se = state.solver
         leafs = [l for l in var.recursive_leaf_asts]
@@ -380,12 +367,12 @@ class TaintTracker(ExplorationTechnique):
             conc = self._concretization_strategy(state, var)
             if not se.solution(var, conc):
                 conc = se.eval(var)
-            key_cnt = get_key_cnt(var)
+            key_cnt = str(var)
             self._concretizations[key_cnt] = conc
             return conc
 
         for cnt in leafs:
-            key_cnt = get_key_cnt(cnt)
+            key_cnt = str(cnt)
             # concretize all unconstrained children
             if cnt.symbolic:
                 # first check whether the value is already constrained
@@ -423,8 +410,7 @@ class TaintTracker(ExplorationTechnique):
         # check whether any of the function parameters are tainted
         # If so, we taint also the return value
         to_taint = False
-        if state.globals[TAINT_APPLIED] and \
-                any([is_or_points_to_tainted_data(a.get_value(state), state) for a in args]):
+        if state.globals[TAINT_APPLIED] and any([is_or_points_to_tainted_data(a.get_value(state), state) for a in args]):
             to_taint = True
 
         # We didn't follow this call,
@@ -508,8 +494,9 @@ class TaintTracker(ExplorationTechnique):
         """
 
         # get the previous bb (the one leading to the call)
-        arg_regs = ordered_argument_registers(state.arch)
-        ret_reg = return_register(state.arch)
+        arg_regs = [reg for reg in state.arch.register_list if reg.argument]
+        # Heuristic to get the return register if we cannot rely on the CC analysis
+        ret_reg = state.arch.register_list[0]
 
         #
         # Argument registers
@@ -653,8 +640,6 @@ class TaintTracker(ExplorationTechnique):
         if self._precise_argument_check:
             # Make sure we have a cached VariableRecovery
             try:
-                # TODO: This isn't super great
-                # NR says: fix this ugly stuff at some point
                 has_cfg = False
                 for st in simgr.active:
                     # As CFG construction might be expensive, we try first to get the functions
