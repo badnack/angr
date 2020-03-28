@@ -3,19 +3,41 @@ import logging
 import random
 from threading import Event
 
-import angr
 import claripy
-from angr.exploration_techniques import ExplorationTechnique
+from ..errors import AngrError, AngrTainterError
+from ..calling_conventions import SimRegArg
+from . import ExplorationTechnique
+from .. import BP_AFTER
 
-from defines import *
+log = logging.getLogger(name=__name__)
 
-log = logging.getLogger("TaintTracking")
-log.setLevel("DEBUG")
+# Taint/Untaint
+TAINT_BUF = "taint_buf"
+# TODO: This should be dynamic
+PAGE_SIZE = 4096  # 1 page
+BOGUS_RETURN = 0x41414141
+GLOB_TAINT_DEP_KEY = 'taint_deps'
+UNTAINT_DATA = 'untainted_data'
+UNTAINTED_VARS = 'untainted_vars'
+ALLOW_UNTAINT = 'allow_untaint'
+
+# Taint dependency
+SEEN_MASTERS = 'seen_masters'
+CURRENT_IFL = 'current_ifl'
+TAINT_APPLIED = 'taint_applied'
+
+# Loops
+BACK_JUMPS = 'back_jumps'
 
 
-def get_sym_val(name, bits):
-    var = claripy.BVS(name=name, size=bits)
-    return var
+# Arch spec info
+def ordered_argument_registers(arch):
+    return list(filter(lambda x: x.argument is True, arch.register_list))
+
+
+# HACK: FIXME: This works, but this is an accident
+def return_register(arch):
+    return ordered_argument_registers(arch)[0]
 
 
 def is_tainted(var, state=None, taint_buf=TAINT_BUF):
@@ -28,8 +50,8 @@ def is_tainted(var, state=None, taint_buf=TAINT_BUF):
     :return:
     """
 
-    def is_untaint_constraint_present(v, untaint_var_strs):
-        for u in untaint_var_strs:
+    def is_untaint_constraint_present(v, untaint_var_strs_local):
+        for u in untaint_var_strs_local:
             # get argument name
             if v.args[0] in u:
                 # variable is untainted
@@ -44,7 +66,7 @@ def is_tainted(var, state=None, taint_buf=TAINT_BUF):
     #
     # something is tainted
     #
-    if not state or not state.globals[FLAGS][AU]:
+    if not state or not state.globals[ALLOW_UNTAINT]:
         return True
 
     # check whether it exists at least one still tainted variable in the expression
@@ -85,7 +107,7 @@ def remove_taint(dst, state):
     # given an expression to untaint, we untaint every single tainted variable in it.
     # E.g., given (taint_x + taint_y) to untaint, both variables gets untainted as
     # they cannot assume no longer arbitrary values down this path.
-    if state.globals[FLAGS][AU]:
+    if state.globals[ALLOW_UNTAINT]:
         return
 
     state = state
@@ -116,8 +138,7 @@ def remove_taint(dst, state):
 
 
 def is_or_points_to_tainted_data(x, state):
-    return is_tainted(x, state) or \
-           is_tainted(state.memory.load(x), state)
+    return is_tainted(x, state) or is_tainted(state.memory.load(x), state)
 
 
 def new_tainted_value(name, bits):
@@ -128,8 +149,7 @@ def new_tainted_value(name, bits):
     :return:
     """
     taint_name = TAINT_BUF + '_' + name + '_'
-    val = get_sym_val(name=taint_name, bits=bits)
-    return val
+    return claripy.BVS(name=taint_name, size=bits)
 
 
 def new_tainted_page(name=''):
@@ -140,8 +160,7 @@ def new_tainted_page(name=''):
     """
     taint_name = TAINT_BUF + '_' + name + '_'
     # TODO: Check the architecture page size
-    val = get_sym_val(name=taint_name, bits=PAGE_SIZE)
-    return val
+    return claripy.BVS(name=taint_name, size=PAGE_SIZE)
 
 
 def apply_taint(state, addr, taint_id='', bits=PAGE_SIZE, var=None):
@@ -149,7 +168,7 @@ def apply_taint(state, addr, taint_id='', bits=PAGE_SIZE, var=None):
     Apply taint to a memory location
 
     :param state: angr state
-    :param addr:  memory address
+    :param addr:  memory address where to store the tainted value
     :param taint_id: taint id
     :param bits: number of bits
     :param var: symbolic variable to store
@@ -157,10 +176,6 @@ def apply_taint(state, addr, taint_id='', bits=PAGE_SIZE, var=None):
     """
     if var is None:
         var = new_tainted_value(taint_id, bits)
-    # if not (isinstance(addr, int) or addr.concrete) and state.globals[SC]:
-    #     # FIXME: Nilo, fix this
-    #     raise RuntimeError("Nilo fix me!")
-    #     #addr = self._get_target_concretization(self, addr, state)
     state.memory.store(addr, var, inspect=False, disable_actions=True)
     state.globals[TAINT_APPLIED] = True
 
@@ -326,7 +341,7 @@ class TaintTracker(ExplorationTechnique):
                 bits = state.inspect.mem_read_length * 8
                 if type(bits) not in (int, ) and hasattr(bits, 'symbolic'):
                     bits = state.solver.max_int(bits)
-                var = get_sym_val(name, bits)
+                var = claripy.BVS(name=name, size=bits)
                 state.memory.store(state.inspect.address_concretization_result[0], var, inspect=False)
 
     def _get_target_concretization(self, var, state):
@@ -417,16 +432,16 @@ class TaintTracker(ExplorationTechnique):
         # In other words, should the return value be bogus, or bogus AND tainted?
         name = 'ret_'
         bits = self.project.arch.bits
-        if state.globals[FLAGS][TR] and to_taint:
+        if self._taint_returns_from_unfollowed_calls and to_taint:
             var = new_tainted_value(name, bits=bits)
         else:
-            var = get_sym_val(name=name, bits=bits)
+            var = claripy.BVS(name=name, size=bits)
 
         ret.set_value(state, var)
 
         # taint function arguments, e.g., we passed a pointer to a function
         # this too should be tainted, it might have been written to!
-        if to_taint and state.globals[FLAGS][TA]:
+        if to_taint and self._taint_arguments_from_unfollowed_calls:
             for o, a in enumerate(args):
                 if not is_or_points_to_tainted_data(a, state):
                     name = '_f_arg_' + str(o)
@@ -457,7 +472,7 @@ class TaintTracker(ExplorationTechnique):
         return True
 
     def _drop_constraints(self, state):
-        log.debug("Dropping constraints from unsat state at %#08x" % state.addr)
+        log.debug("Dropping constraints from unsat state at %#08x", state.addr)
         state.solver._stored_solver.constraints = []
         state.solver.reload_solver()
 
@@ -470,10 +485,9 @@ class TaintTracker(ExplorationTechnique):
         """
         try:
             f = self.project.kb.functions[state.addr]
-        except:
-            log.warning("Your code just called a "
-                               "function not in the CFG at %#08x.  Falling back to "
-                               "a naive approach..." % state.addr)
+        except KeyError:
+            log.warning("Your code just called a function not in the CFG at %#08x. Falling back to a naive approach...",
+                        state.addr)
             return None
 
         try:
@@ -481,7 +495,7 @@ class TaintTracker(ExplorationTechnique):
             if cca.cc:
                 return cca.cc
         except Exception as e:
-            log.exception("get_function_argumens_precise failed: %s" % str(e))
+            log.exception("get_function_argumens_precise failed: %r", e)
         return None
 
     def _get_calling_convention_fast(self, state):
@@ -503,8 +517,8 @@ class TaintTracker(ExplorationTechnique):
 
         try:
             caller_bl = self.project.factory.block(state.history.addr)
-        except:
-            raise
+        except AngrError:
+            raise AngrTainterError("Unable to factory basic block for address %#08x", state.history.addr)
         puts = [s for s in caller_bl.vex.statements if s.tag == 'Ist_Put']
 
         expected = 0
@@ -523,7 +537,7 @@ class TaintTracker(ExplorationTechnique):
                 # got the expected argument, check if tainted
                 reg_name = arg_regs[expected].name
                 reg_size = arg_regs[expected].size
-                var = angr.calling_conventions.SimRegArg(reg_name, reg_size)
+                var = SimRegArg(reg_name, reg_size)
                 sim_args.append(var)
                 expected += 1
                 index = 0
@@ -534,7 +548,7 @@ class TaintTracker(ExplorationTechnique):
         # Return register
         #
 
-        ret = angr.calling_conventions.SimRegArg(ret_reg.name, ret_reg.size)
+        ret = SimRegArg(ret_reg.name, ret_reg.size)
 
         return sim_args, ret
 
@@ -548,7 +562,7 @@ class TaintTracker(ExplorationTechnique):
         """
         args = []
         ret = None
-        if state.globals[FLAGS][PAC]:
+        if self._precise_argument_check:
             cc = self._get_calling_convention_precise(state)
             if cc:
                 args = cc.args
@@ -569,38 +583,37 @@ class TaintTracker(ExplorationTechnique):
         :return: True if call should be followed, false otherwise
         """
 
-        if state.globals[FLAGS][NFC]:
+        if self._not_follow_any_calls:
             log.debug("Calls are disabled")
             return False
 
         if state.addr in self._function_whitelist:
-            log.debug("Function %#08x is whitelisted, following" % state.addr)
+            log.debug("Function %#08x is whitelisted, following", state.addr)
             return True
+
+        if state.addr in self._function_blacklist:
+            log.debug("Function %#08x is blacklisted, not following", state.addr)
+            return False
 
         # check if call falls within bound binary
         if state.addr > self.project.loader.max_addr or state.addr < self.project.loader.min_addr:
-            log.debug("Function %#08x is outside the mapped memory, not following" % state.addr)
+            log.debug("Function %#08x is outside the mapped memory, not following", state.addr)
             return False
 
         # if the function is summarized by angr, we follow it
         if self.project.is_hooked(state.addr):
-            log.debug("Function %#08x is a SimProcedure, following" % state.addr)
+            log.debug("Function %#08x is a SimProcedure, following", state.addr)
             return True
-
-        # NOTE: EDG: Do we want this before the simprocs?
-        if state.addr in self._function_blacklist:
-            log.debug("Function %#08x is blacklisted, not following" % state.addr)
-            return False
 
         # Check if we hit our inter-function limit
         if state.globals[CURRENT_IFL] <= 0:
-            log.debug("Function %#08x is outside the inter-function level, not following" % state.addr)
+            log.debug("Function %#08x is outside the inter-function level, not following", state.addr)
             return False
 
         # The rest is about smart calls, so if we don't use those
         # we're done now.
         if not self._smart_call:
-            log.debug("Will follow call to %#08x. (smart calls are disabled)" % state.addr)
+            log.debug("Will follow call to %#08x. (smart calls are disabled)", state.addr)
             return True
 
         #
@@ -609,15 +622,15 @@ class TaintTracker(ExplorationTechnique):
 
         # If we never applied any taint to this state, then obviously we shouldn't go there
         if not state.globals[TAINT_APPLIED]:
-            log.debug("Not following call to %#08x, no taint is applied" % state.addr)
+            log.debug("Not following call to %#08x, no taint is applied", state.addr)
             return False
 
         sim_args, _ = self._get_calling_convention(state)
 
         if any([is_or_points_to_tainted_data(sim_arg.get_value(state), state) for sim_arg in sim_args]):
-                log.debug("Argument containts taint, following call to %#08x" % state.addr)
-                return True
-        log.debug("Not following call to %#08x, no tainted data present" % state.addr)
+            log.debug("Argument containts taint, following call to %#08x", state.addr)
+            return True
+        log.debug("Not following call to %#08x, no tainted data present", state.addr)
         return False
 
     #
@@ -652,19 +665,16 @@ class TaintTracker(ExplorationTechnique):
 
                     starting_f = self.project.kb.functions[st.addr]
                     self.project.analyses.VariableRecoveryFast(starting_f)
-            except:
-                log.exception("Couldn't find Function %#08x analysis will switch back to a faster yet less precise"
-                              "mode", st.addr)
+            except KeyError:
+                log.exception("Couldn't find Function %#08x analysis will switch back to a faster yet less precise mode",
+                              st.addr)
                 self._precise_argument_check = False
 
         # Register breakpoints
         for s in simgr.active:
-            if self._use_smart_concretization:
-                if self._taint_deref_values:
-                    s.inspect.b(
-                        'address_concretization',
-                        angr.BP_AFTER,
-                        action=self._addr_concrete_after)
+            if self._use_smart_concretization and self._taint_deref_values:
+                s.inspect.b('address_concretization', BP_AFTER, action=self._addr_concrete_after)
+
             for what, why, when in self._callbacks:
                 s.inspect.b(why, when, action=what)
 
@@ -677,25 +687,9 @@ class TaintTracker(ExplorationTechnique):
             s.globals[CURRENT_IFL] = self._interfunction_level
             s.globals[TAINT_APPLIED] = False
             s.globals[BACK_JUMPS] = {}
+            s.globals[ALLOW_UNTAINT] = self._allow_untaint
 
-            # flags
-            s.globals[FLAGS] = {}
-            s.globals[FLAGS][IL] = self._interfunction_level
-            s.globals[FLAGS][SC] = self._smart_call
-            s.globals[FLAGS][PAC] = self._precise_argument_check
-            s.globals[FLAGS][FU] = self._follow_unsat
-            s.globals[FLAGS][NFC] = self._not_follow_any_calls
-            s.globals[FLAGS][TR] = self._taint_returns_from_unfollowed_calls
-            s.globals[FLAGS][TA] = self._taint_arguments_from_unfollowed_calls
-            s.globals[FLAGS][AU] = self._allow_untaint
-            s.globals[FLAGS][SCC] = self._use_smart_concretization
-
-    def step(self, simgr, *kargs, **kwargs):
-
-        for s in simgr.active:
-            s.globals[BACK_JUMPS] = copy.deepcopy(s.globals[BACK_JUMPS])
-            s.globals[GLOB_TAINT_DEP_KEY] = copy.deepcopy(s.globals[GLOB_TAINT_DEP_KEY])
-            s.globals[UNTAINT_DATA] = copy.deepcopy(s.globals[UNTAINT_DATA])
+    def step(self, simgr, *args, **kwargs):
 
         # Step the simmanager
         simgr = simgr.step(**kwargs)
@@ -708,16 +702,16 @@ class TaintTracker(ExplorationTechnique):
 
         # Look at the sat states
         for s in simgr.active:
-            log.debug("Checking state at %#08x" % s.addr)
+            log.debug("Checking state at %#08x", s.addr)
 
             # Did we just call something? Check the IFL
             if s.history.jumpkind == "Ijk_Call":
                 if self._should_follow_call(s):
                     # follow the call
-                    log.debug("Following function call to %#08x" % s.addr)
+                    log.debug("Following function call to %#08x", s.addr)
                     s.globals[CURRENT_IFL] -= 1
                 else:
-                    log.debug("Not following function call to %#08x" % s.addr)
+                    log.debug("Not following function call to %#08x", s.addr)
                     # Don't follow the call, make it into a "fake ret"
                     self._fake_ret(s)
 
@@ -729,7 +723,7 @@ class TaintTracker(ExplorationTechnique):
             if s.history.jumpkind == 'Ijk_Boring' and \
                     s.addr <= s.history.addr and \
                     not self._should_follow_back_jump(s):
-                log.debug("Breaking loop at %#08x" % s.addr)
+                log.debug("Breaking loop at %#08x", s.addr)
                 simgr.active.remove(s)
                 simgr.deadended.append(s)
 
